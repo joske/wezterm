@@ -11,6 +11,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::os::wayland::wezterm_frame::WezTermFrame;
 use anyhow::{anyhow, bail};
 use async_io::Timer;
 use async_trait::async_trait;
@@ -28,7 +29,6 @@ use smithay_client_toolkit::reexports::csd_frame::{
 };
 use smithay_client_toolkit::reexports::protocols::xdg::shell::client::xdg_toplevel::ResizeEdge as XdgResizeEdge;
 use smithay_client_toolkit::seat::pointer::CursorIcon;
-use smithay_client_toolkit::shell::xdg::fallback_frame::FallbackFrame;
 use smithay_client_toolkit::shell::xdg::window::{
     DecorationMode, Window as XdgWindow, WindowConfigure, WindowDecorations as Decorations,
     WindowHandler,
@@ -241,32 +241,38 @@ impl WaylandWindow {
 
         let window = {
             let xdg_shell = &conn.wayland_state.borrow().xdg;
-            let initial_decorations =
-                if !config.window_decorations.contains(WindowDecorations::TITLE) {
-                    Decorations::None
-                } else {
-                    Decorations::RequestServer
-                };
-            xdg_shell.create_window(surface.clone(), initial_decorations, &qh)
+            xdg_shell.create_window(surface.clone(), Decorations::RequestServer, &qh)
         };
 
         window.set_app_id(class_name.to_string());
         window.set_title(name.to_string());
+        let decorations = config.window_decorations;
 
-        let decor_mode = if !config.window_decorations.contains(WindowDecorations::TITLE) {
+        // Map window_decorations to a decoration strategy:
+        //   NONE                 -> no frame, no decorations at all
+        //   TITLE | RESIZE        -> let the compositor draw server-side decorations
+        //   anything else (TITLE, RESIZE, INTEGRATED_BUTTONS|RESIZE, ...)
+        //                        -> our own client-side frame, with the titlebar shown
+        //                           only when TITLE is requested (otherwise wezterm draws
+        //                           its own integrated buttons in the tab bar) and resize
+        //                           borders active only when RESIZE is requested.
+        let decor_mode = if decorations == WindowDecorations::NONE {
             None
-        } else if config.window_decorations == WindowDecorations::default() {
+        } else if decorations == WindowDecorations::default() {
             Some(DecorationMode::Server)
         } else {
             Some(DecorationMode::Client)
         };
         window.request_decoration_mode(decor_mode);
 
+        let hide_titlebar = !decorations.contains(WindowDecorations::TITLE);
+        let resizable = decorations.contains(WindowDecorations::RESIZE);
+
         let mut window_frame = {
             let wayland_state = &conn.wayland_state.borrow();
             let shm = &wayland_state.shm;
             let subcompositor = wayland_state.subcompositor.clone();
-            FallbackFrame::new(&window, shm, subcompositor, qh.clone())
+            WezTermFrame::new(&window, shm, subcompositor, qh.clone(), hide_titlebar)
                 .expect("failed to create csd frame")
         };
         let hidden = match decor_mode {
@@ -274,6 +280,7 @@ impl WaylandWindow {
             _ => true,
         };
         window_frame.set_hidden(hidden);
+        window_frame.set_resizable(resizable);
         if !hidden {
             window_frame.resize(
                 NonZeroU32::new(dimensions.pixel_width as u32)
@@ -284,12 +291,12 @@ impl WaylandWindow {
         }
 
         window.set_min_size(Some((32, 32)));
-        let (x, y) = window_frame.location();
         let surface_width = dimensions.pixels_to_surface(dimensions.pixel_width as i32);
         let surface_height = dimensions.pixels_to_surface(dimensions.pixel_height as i32);
+        let (gx, gy, gw, gh) = window_frame.geometry(surface_width as u32, surface_height as u32);
         window
             .xdg_surface()
-            .set_window_geometry(x, y, surface_width, surface_height);
+            .set_window_geometry(gx, gy, gw as i32, gh as i32);
         window.commit();
 
         let pending_mouse = PendingMouse::create(window_id);
@@ -517,6 +524,10 @@ impl WindowOps for WaylandWindow {
         WaylandConnection::with_window_inner(self.0, move |inner| Ok(inner.maximize()));
     }
 
+    fn request_drag_move(&self) {
+        WaylandConnection::with_window_inner(self.0, move |inner| Ok(inner.request_drag_move()));
+    }
+
     fn restore(&self) {
         WaylandConnection::with_window_inner(self.0, move |inner| Ok(inner.restore()));
     }
@@ -585,7 +596,7 @@ pub struct WaylandWindowInner {
     pub(crate) events: WindowEventSender,
     surface_factor: f64,
     window: Option<XdgWindow>,
-    pub(super) window_frame: FallbackFrame<WaylandState>,
+    pub(super) window_frame: WezTermFrame<WaylandState>,
     dimensions: Dimensions,
     resize_increments: Option<ResizeIncrement>,
     window_state: WindowState,
@@ -881,7 +892,11 @@ impl WaylandWindowInner {
                 let mut pixel_width = self.surface_to_pixels(w.try_into().unwrap());
                 let mut pixel_height = self.surface_to_pixels(h.try_into().unwrap());
 
-                if self.window_state.can_resize() {
+                let resize_allowed = self
+                    .config
+                    .window_decorations
+                    .contains(WindowDecorations::RESIZE);
+                if self.window_state.can_resize() && resize_allowed {
                     self.window_frame.set_resizable(true);
                     if let Some(incr) = self.resize_increments {
                         let min_width = incr.base_width + incr.x;
@@ -913,14 +928,16 @@ impl WaylandWindowInner {
                     self.window_frame.resize(width, height);
                     pending.refresh_decorations = true
                 }
-                let (x, y) = self.window_frame.location();
                 let surface_width = self.pixels_to_surface(pixel_width);
                 let surface_height = self.pixels_to_surface(pixel_height);
+                let (gx, gy, gw, gh) = self
+                    .window_frame
+                    .geometry(surface_width as u32, surface_height as u32);
                 self.window
                     .as_mut()
                     .unwrap()
                     .xdg_surface()
-                    .set_window_geometry(x, y, surface_width, surface_height);
+                    .set_window_geometry(gx, gy, gw as i32, gh as i32);
                 // Compute the new pixel dimensions
                 let new_dimensions = Dimensions {
                     pixel_width: pixel_width.try_into().unwrap(),
@@ -1275,6 +1292,28 @@ impl WaylandWindowInner {
     fn maximize(&mut self) {
         if let Some(window) = self.window.as_mut() {
             window.set_maximized();
+        }
+    }
+
+    /// Start an interactive, compositor-driven window move. Used when the user
+    /// drags the tab bar (eg: with `INTEGRATED_BUTTONS|RESIZE`, where there is
+    /// no server/CSD titlebar to grab).
+    fn request_drag_move(&mut self) {
+        let window = match self.window.as_ref() {
+            Some(w) => w,
+            None => return,
+        };
+        let conn = WaylandConnection::get().unwrap().wayland();
+        let state = conn.wayland_state.borrow();
+        if let Some(pointer) = state.pointer.as_ref() {
+            let wl_pointer = pointer.pointer();
+            let pointer_data = match wl_pointer.data::<PointerUserData>() {
+                Some(d) => d,
+                None => return,
+            };
+            let seat = pointer_data.pdata.seat();
+            let serial = *state.last_serial.borrow();
+            window.move_(seat, serial);
         }
     }
 
